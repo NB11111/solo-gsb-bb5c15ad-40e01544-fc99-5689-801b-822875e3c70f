@@ -116,6 +116,63 @@ async def create_session(body: CreateSessionBody) -> JSONResponse:
     return JSONResponse(status_code=201, content=_serialize(row))
 
 
+class ForkBody(BaseModel):
+    token: str | None = Field(default=None, description="目标会话令牌；不传则自动生成")
+
+
+@router.post("/{token}/fork")
+async def fork_session(token: str, body: ForkBody | None = None) -> JSONResponse:
+    """**会话快照分支**：在单个 SQLite 写事务中读取源会话并创建新 token。
+
+    完整复制绑定的 scenario revision、state、业务 context、`_seq` 计数器与
+    seed 随机序列位置（`_rng`）：分支后首个相同请求得到与源会话同快照一致的
+    结果。事件历史不复制，分支后两条会话各自独立推进。
+    """
+    new_token = (body.token if body else None) or f"sess-{secrets.token_hex(12)}"
+
+    with write_tx() as conn:
+        row = conn.execute(
+            "SELECT scenario, revision, state, context FROM sessions WHERE token = ?",
+            (token,),
+        ).fetchone()
+        if row is None:
+            return JSONResponse(status_code=404,
+                                content={"error": "session_not_found", "token": token})
+
+        scenario_name = row["scenario"]
+        revision = row["revision"]
+        if revision is None:  # 兜底：异常旧数据缺 revision 时按当前版本处理
+            revision = store.current_revision(scenario_name)
+        if store.get(scenario_name, revision) is None:
+            return JSONResponse(status_code=410, content={
+                "error": "scenario_unloaded", "scenario": scenario_name,
+                "revision": revision,
+                "detail": "源会话绑定的场景版本已卸载，无法分支",
+            })
+
+        try:
+            # context 原文整体复制：_seq 计数与 _rng 随机序列位置随之完整快照；
+            # 事件历史（events 表）不复制
+            conn.execute(
+                "INSERT INTO sessions(token, scenario, revision, state, context)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (new_token, scenario_name, row["revision"], row["state"], row["context"]),
+            )
+        except sqlite3.IntegrityError:
+            return JSONResponse(status_code=409,
+                                content={"error": "session_exists", "token": new_token})
+
+    result = {
+        "forked": True,
+        "source_token": token,
+        **_serialize(_session_row(new_token)),
+        "events_copied": False,
+        "detail": "已复制绑定的 scenario revision、state、业务 context、seq 计数与随机序列位置；"
+                  "事件历史不复制，分支后两条会话独立推进",
+    }
+    return JSONResponse(status_code=201, content=result)
+
+
 @router.get("/{token}")
 async def get_session(token: str) -> JSONResponse:
     row = _session_row(token)
