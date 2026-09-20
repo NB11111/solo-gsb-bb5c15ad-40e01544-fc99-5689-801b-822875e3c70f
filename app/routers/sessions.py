@@ -1,4 +1,4 @@
-"""会话管理接口：创建 / 查询状态 / 重置 / 事件历史 / 单请求与请求链预演。"""
+"""会话管理接口：创建 / 查询状态 / 快照分支 / 重置 / 事件历史 / 单请求与请求链预演。"""
 from __future__ import annotations
 
 import json
@@ -114,6 +114,68 @@ async def create_session(body: CreateSessionBody) -> JSONResponse:
 
     row = _session_row(token)
     return JSONResponse(status_code=201, content=_serialize(row))
+
+
+class ForkBody(BaseModel):
+    token: str | None = Field(default=None, description="目标会话令牌；不传则自动生成")
+
+
+@router.post("/{token}/fork")
+async def fork_session(token: str, body: ForkBody | None = None) -> JSONResponse:
+    """**会话快照分支**：在单个 SQLite 写事务中读取源会话并创建新令牌。
+
+    完整复制绑定的 scenario revision、当前状态、业务上下文、``_seq`` 计数器与
+    seed 随机序列位置（``_rng``）：分支后首个相同请求得到与源会话同快照一致的
+    结果。事件历史不复制，两条会话此后独立推进。
+    """
+    target_token = (body.token if body else None) or f"sess-{secrets.token_hex(12)}"
+
+    with write_tx() as conn:
+        row = conn.execute(
+            "SELECT token, scenario, revision, state, context"
+            " FROM sessions WHERE token = ?",
+            (token,),
+        ).fetchone()
+        if row is None:
+            return JSONResponse(status_code=404, content={
+                "error": "session_not_found", "token": token})
+        scenario_name = row["scenario"]
+        revision = row["revision"]
+        if revision is None:  # 兜底：异常旧数据缺 revision 时按当前版本处理
+            revision = store.current_revision(scenario_name)
+        if revision is None or store.get(scenario_name, revision) is None:
+            return JSONResponse(status_code=410, content={
+                "error": "scenario_unloaded", "scenario": scenario_name,
+                "revision": revision})
+        try:
+            conn.execute(
+                "INSERT INTO sessions(token, scenario, revision, state, context)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (target_token, scenario_name, revision, row["state"], row["context"]),
+            )
+        except sqlite3.IntegrityError:
+            return JSONResponse(status_code=409, content={
+                "error": "session_exists", "token": target_token})
+
+    # 快照摘要：与源会话逐字节一致的 state / context / seq / 随机序列位置
+    context = json.loads(row["context"])
+    random_info = SessionRNG.info(context)
+    context.pop(SessionRNG.STATE_KEY, None)
+    seq = context.pop("_seq", {}) or {}
+    return JSONResponse(status_code=201, content={
+        "forked": True,
+        "source": {"token": token, "scenario": scenario_name, "revision": revision},
+        "target": _serialize(_session_row(target_token)),
+        "snapshot": {
+            "state": row["state"],
+            "context": context,
+            "seq": seq,
+            "random": random_info,
+        },
+        "events_copied": False,
+        "detail": "绑定 revision、状态、业务上下文、seq 计数与随机序列位置已整体复制；"
+                  "事件历史不复制，两条会话此后独立推进",
+    })
 
 
 @router.get("/{token}")

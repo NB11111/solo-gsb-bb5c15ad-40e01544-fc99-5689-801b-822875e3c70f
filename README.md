@@ -14,6 +14,11 @@ YAML 场景，服务按**会话令牌**隔离每个调用方的当前状态，�
 同一个 SQLite 写事务中推进，会话查询中可看到累计抽样步数。未传 seed 时保持
 原有的进程级随机行为与接口兼容。
 
+会话支持**快照分支（fork）**：`POST /__sessions/{token}/fork` 在单个 SQLite 写事务中
+读取源会话并创建新令牌，完整复制绑定的 scenario revision、状态、业务上下文、
+`seq` 计数与 seed 随机序列位置——分支后首个相同请求得到与源会话同快照一致的结果，
+此后两条会话独立推进，事件历史不复制。
+
 - 技术栈：Python 3.12 · FastAPI · SQLite（WAL）· Jinja2 沙箱模板 · PyYAML
 - 容器内启动即自动完成依赖安装与数据库初始化（含旧库就地升级），并自动加载 `scenarios/` 下的示例场景
 
@@ -33,6 +38,7 @@ docker compose up --build -d
 | Swagger 文档 | <http://localhost:8080/docs> |
 | 场景管理 | `http://localhost:8080/__scenarios` |
 | 会话状态 | `http://localhost:8080/__sessions/{token}` |
+| 会话快照分支 | `POST http://localhost:8080/__sessions/{token}/fork` |
 | 请求预演 | `POST http://localhost:8080/__sessions/{token}/preview` |
 | 连续请求链预演 | `POST http://localhost:8080/__sessions/{token}/preview/chain` |
 | 模拟业务流量 | 除上述管理前缀外的任意路径，如 `POST http://localhost:8080/orders` |
@@ -226,6 +232,7 @@ curl -s "$BASE/__scenarios/order-flow/yaml?revision=1"
 | POST | `/__sessions` | 显式创建会话：`{"token":"t1","scenario":"order-flow","state":"created","context":{}}`，字段均可省略；可传 `"seed"` 启用可复现随机序列；绑定**当前 revision** 并在响应中返回 |
 | GET | `/__sessions/{token}` | **会话状态查询**：当前状态、绑定的 `revision`、上下文、随机序列摘要 `random`（`seed` 与累计抽样步数 `draws`，未启用为 `null`）、可用状态、路由列表（按绑定版本给出） |
 | GET | `/__sessions/{token}/events?limit=50` | 最近的匹配与状态迁移历史（新→旧，含每次命中时的 `revision`） |
+| POST | `/__sessions/{token}/fork` | **会话快照分支**：单个写事务中复制绑定 revision、状态、上下文、`seq` 与随机序列位置到新令牌；可指定目标 token（冲突 409），源会话不存在 404，绑定版本已卸载 410；事件历史不复制 |
 | POST | `/__sessions/{token}/preview` | **请求预演**：不落库地试运行一次业务请求，返回拟响应与 state/context 差异（按会话绑定的 revision 执行） |
 | POST | `/__sessions/{token}/preview/chain` | **连续请求链预演**：有序请求数组基于同一会话快照依次试跑（最多 50 步），逐步返回命中/拟响应/差异与最终快照，不落库 |
 | POST | `/__sessions/{token}/reset` | 重置到初始（或指定）状态并清空事件；不改变会话绑定的 revision；可传 `"seed"` 让随机序列从头初始化 |
@@ -273,6 +280,46 @@ curl -s $BASE/__sessions/s1
 # 重置并重新播种：随机序列从头开始
 curl -s -X POST $BASE/__sessions/s1/reset -H 'Content-Type: application/json' \
   -d '{"state":"created","seed":"demo-1"}'
+```
+
+#### 会话快照分支（fork）
+
+`POST /__sessions/{token}/fork` 把源会话的**完整快照**在**单个 SQLite 写事务**中
+复制到一个新令牌：绑定的 scenario revision、当前状态、业务上下文、`_seq` 计数器与
+seed 随机序列位置（`_rng`）逐字节拷贝。分支成功后，**首个相同请求**打到任一条会话
+都会得到与源会话同快照一致的结果（seed 会话的 `uuid4()` 等随机函数从同一序列位置
+继续取值），此后两条会话各自独立推进、互不影响。
+
+- 请求体可指定 `{"token": "t2"}` 作为目标令牌；不传（或不传 body）则自动生成；
+- 目标令牌已存在返回 `409 session_exists`；源会话不存在返回 `404 session_not_found`；
+  源会话绑定的场景版本已卸载返回 `410 scenario_unloaded`；
+- **事件历史不复制**：新令牌的事件列表从分支后开始记录；
+- 响应返回源/目标标识与快照摘要（状态、业务上下文、`seq` 计数、随机序列摘要）。
+
+```bash
+# 1) 源会话：created 状态 + seed
+curl -s -X POST $BASE/__sessions -H 'Content-Type: application/json' \
+  -d '{"token":"s1","state":"created","seed":"demo-1"}'
+
+# 2) 分支出 s2：复制绑定 revision / 状态 / 上下文 / seq / 随机序列位置
+curl -s -X POST $BASE/__sessions/s1/fork -H 'Content-Type: application/json' \
+  -d '{"token":"s2"}'
+# -> 201 {"forked":true,
+#         "source":{"token":"s1","scenario":"order-flow","revision":1},
+#         "target":{"token":"s2","state":"created",...},
+#         "snapshot":{"state":"created","context":{...},"seq":{...},
+#                     "random":{"seed":"demo-1","draws":0}},
+#         "events_copied":false}
+
+# 3) 同一支付请求先后打到两条会话：trace（uuid4）完全一致
+curl -s -X POST $BASE/orders/7/pay -H 'sim-session-token: s1' \
+  -H 'Content-Type: application/json' -d '{"channel":"alipay"}'
+curl -s -X POST $BASE/orders/7/pay -H 'sim-session-token: s2' \
+  -H 'Content-Type: application/json' -d '{"channel":"alipay"}'
+# -> 两个响应体的 trace 字段相同；此后两条会话独立推进
+
+# 4) s2 的事件历史从分支后开始（不复制 s1 的历史）
+curl -s "$BASE/__sessions/s2/events"
 ```
 
 #### 请求预演（dry-run）
@@ -535,7 +582,7 @@ SIM_SCENARIOS_DIR=/app/scenarios docker compose run --rm \
 │   ├── store.py           # 已编译场景缓存（按 name+revision）、发布/激活
 │   └── routers/
 │       ├── scenarios.py   # 场景校验/版本发布/版本列表/激活/查询/删除
-│       └── sessions.py    # 会话创建/状态查询/重置/事件/单请求与请求链预演
+│       └── sessions.py    # 会话创建/状态查询/快照分支/重置/事件/单请求与请求链预演
 ├── scenarios/
 │   └── order-flow.yaml    # 示例场景（随启动自动加载）
 ├── requirements.txt
